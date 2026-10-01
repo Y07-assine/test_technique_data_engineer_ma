@@ -1,0 +1,6 @@
+# Environnement local hors Docker (tests unitaires / d'intégration Spark). Nécessite Java 8, 11 ou 17.
+pyspark==3.5.3
+requests==2.32.3
+boto3==1.35.54
+psycopg2-binary==2.9.10
+pytest==8.3.3

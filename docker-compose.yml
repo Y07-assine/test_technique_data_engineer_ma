@@ -1,0 +1,155 @@
+name: taxi-pipeline
+
+x-pipeline-env: &pipeline-env
+  # --- Période et source ---
+  TRIPS_START_DATE: ${TRIPS_START_DATE:-2023-01-01}
+  TRIPS_END_DATE: ${TRIPS_END_DATE:-2023-03-31}
+  SODA_APP_TOKEN: ${SODA_APP_TOKEN:-}
+  SODA_PAGE_SIZE: ${SODA_PAGE_SIZE:-50000}
+  # --- Datalake (MinIO) ---
+  DATALAKE_ROOT: s3a://${DATALAKE_BUCKET:-datalake}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  # --- Spark ---
+  SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
+  SPARK_SHUFFLE_PARTITIONS: ${SPARK_SHUFFLE_PARTITIONS:-8}
+  # --- Exposition ---
+  ANALYTICS_DB_HOST: postgres
+  ANALYTICS_DB_NAME: ${ANALYTICS_DB_NAME:-analytics}
+  ANALYTICS_DB_USER: ${ANALYTICS_DB_USER:-analytics}
+  ANALYTICS_DB_PASSWORD: ${ANALYTICS_DB_PASSWORD:-analytics}
+
+x-airflow-common: &airflow-common
+  build: .
+  image: taxi-pipeline/airflow:latest
+  environment:
+    <<: *pipeline-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-local-only}
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+  volumes:
+    # Code monté en lecture seule : une modification locale est prise en compte sans rebuild.
+    - ./dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/src:ro
+    - ./scripts:/opt/airflow/scripts:ro
+    - ./tests:/opt/airflow/tests:ro
+    - airflow-logs:/opt/airflow/logs
+  depends_on: &airflow-depends-on
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+      ANALYTICS_DB_NAME: ${ANALYTICS_DB_NAME:-analytics}
+      ANALYTICS_DB_USER: ${ANALYTICS_DB_USER:-analytics}
+      ANALYTICS_DB_PASSWORD: ${ANALYTICS_DB_PASSWORD:-analytics}
+    ports:
+      # Accès BI (base `analytics`). 5433 côté hôte pour ne pas entrer en conflit
+      # avec un PostgreSQL installé localement sur le port standard.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-analytics-db.sh:/docker-entrypoint-initdb.d/init-analytics-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Les images officielles minio/minio ne sont plus publiées sur Docker Hub :
+  # on utilise le packaging Bitnami de la même release MinIO (2024-10-13).
+  minio:
+    image: bitnamilegacy/minio:2024.10.13
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # console web
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: bitnamilegacy/minio-client:2024.10.8
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      DATALAKE_BUCKET: ${DATALAKE_BUCKET:-datalake}
+    # L'image Bitnami redémarre MinIO après sa phase d'initialisation : on réessaie
+    # la connexion (30 x 2 s) plutôt que de supposer le service stable dès le healthcheck.
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do
+        mc --config-dir /tmp/mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} && break;
+        echo 'MinIO not ready, retrying...'; sleep 2;
+      done &&
+      mc --config-dir /tmp/mc mb --ignore-existing local/$${DATALAKE_BUCKET}
+      "
+
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *pipeline-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+
+  airflow-webserver:
+    <<: *airflow-common
+    # Le PID de gunicorn est écrit dans le conteneur : après un stop/start il serait
+    # obsolète et bloquerait le démarrage ("Already running on PID ...").
+    command: ["bash", "-c", "rm -f /opt/airflow/airflow-webserver.pid && exec airflow webserver"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    ports:
+      - "4040-4045:4040-4045"   # Spark UI des tâches en cours
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:

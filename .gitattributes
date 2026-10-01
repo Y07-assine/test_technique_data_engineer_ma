@@ -1,0 +1,4 @@
+# Les scripts exécutés dans les conteneurs Linux doivent garder des fins de ligne LF,
+# y compris après un clone sous Windows.
+*.sh text eol=lf
+*.py text eol=lf

@@ -1,0 +1,6 @@
+# Dépendances ajoutées à l'image Airflow (versions non figées ici = contraintes officielles Airflow).
+pyspark==3.5.3
+requests
+boto3
+psycopg2-binary
+pytest
